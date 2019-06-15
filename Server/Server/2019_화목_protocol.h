@@ -40,6 +40,7 @@ struct sc_packet_login_ok {
 struct sc_packet_login_fail {
 	char size;
 	char type;
+	wchar_t	message[MAX_STR_LEN];
 };
 
 struct sc_packet_position {
@@ -52,7 +53,7 @@ struct sc_packet_position {
 struct sc_packet_chat {
 	char size;
 	char type;
-	int	id;
+	wchar_t id[10];
 	wchar_t	message[MAX_STR_LEN];
 };
 

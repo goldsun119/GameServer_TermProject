@@ -26,6 +26,7 @@ char		packet_buffer[BUF_SIZE];
 DWORD				in_packet_size = 0;
 int						saved_packet_size = 0;
 int			g_myid;
+int			exp, level, hp;
 int			g_left_x = 0, g_top_y = 0;
 int			skill_timer = 0;
 
@@ -192,19 +193,31 @@ void init()
 	recv_wsabuf.len = BUF_SIZE;
 
 	int retval = send(g_mysocket, my_id, strlen(my_id), 0);
-	char buf[10];
-	retval = recv(g_mysocket, buf, 10, 0);
-
-	if (strcmp(buf, "False") == 0) {
-		MessageBoxA(cpy_hwnd, "DB에서 ID,PW를 확인할 수 없습니다..!\n프로그램을 종료합니다.", "DB 오류", MB_OK);
-		exit(-1);
-	}
-	else if (strcmp(buf, "Exist") == 0) {
-		MessageBoxA(cpy_hwnd, "이미 접속유저가 있습니다..!\n프로그램을 종료합니다.", "DB 접속", MB_OK);
-		exit(-1);
-	}
-	else if (strcmp(buf, "Newid") == 0) {
-		MessageBoxA(cpy_hwnd, "아이디가 없습니다.\nID를 만들어서 게임을 시작합니다.", "DB 생성", MB_OK);
+	char buf[30];
+	retval = recv(g_mysocket, buf, 30, 0);
+	if (buf[1] == SC_LOGIN_OK)
+	{
+		sc_packet_login_ok *packet = reinterpret_cast<sc_packet_login_ok *>(buf);
+		g_myid = packet->id;
+		level = packet->LEVEL;
+		exp = packet->EXP;
+		hp = packet->HP;
+	}	
+	else if (buf[1] == SC_LOGIN_FAIL)
+	{
+		sc_packet_login_fail * packet = reinterpret_cast<sc_packet_login_fail *>(buf);
+		//TODO
+		if (strcmp(buf, "False") == 0) {
+			MessageBoxA(cpy_hwnd, "DB에서 ID,PW를 확인할 수 없습니다..!\n프로그램을 종료합니다.", "DB 오류", MB_OK);
+			exit(-1);
+		}
+		else if (strcmp(buf, "Exist") == 0) {
+			MessageBoxA(cpy_hwnd, "이미 접속유저가 있습니다..!\n프로그램을 종료합니다.", "DB 접속", MB_OK);
+			exit(-1);
+		}
+		else if (strcmp(buf, "Newid") == 0) {
+			MessageBoxA(cpy_hwnd, "아이디가 없습니다.\nID를 만들어서 게임을 시작합니다.", "DB 생성", MB_OK);
+		}
 	}
 
 	WSAAsyncSelect(g_mysocket, main_window_handle, WM_SOCKET, FD_CLOSE | FD_READ);
@@ -246,14 +259,6 @@ void ProcessPacket(char *ptr)
 {
 	static bool first_time = true;
 	switch (ptr[1]) {
-	case SC_LOGIN_OK:
-	{
-		break;
-	}
-	case SC_LOGIN_FAIL:
-	{
-		break;
-	}
 	case SC_POSITION:
 	{
 		break;
