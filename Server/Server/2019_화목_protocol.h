@@ -3,8 +3,8 @@
 constexpr int MAX_USER = 10000;
 constexpr int MAX_STR_LEN = 50;
 
-constexpr int NPC_ID_START = 1000;
-constexpr int NUM_NPC = 200000;
+constexpr int NPC_ID_START = 10000;
+constexpr int NUM_NPC = 820;
 
 #define WORLD_WIDTH		300
 #define WORLD_HEIGHT	300
@@ -18,6 +18,7 @@ constexpr int NUM_NPC = 200000;
 #define CS_ATTACK		3
 #define CS_CHAT			4
 #define CS_LOGOUT		5
+#define CS_TELEPORT	6
 
 #define SC_LOGIN_OK			1
 #define SC_LOGIN_FAIL			2
@@ -48,12 +49,15 @@ struct sc_packet_position {
 	char type;
 	int id;
 	short x, y;
+	char dir;
+	char ani;
 };
 
 struct sc_packet_chat {
 	char size;
 	char type;
-	wchar_t id[10];
+	//wchar_t id[10];
+	int id;
 	wchar_t	message[MAX_STR_LEN];
 };
 
@@ -62,6 +66,9 @@ struct sc_packet_stat_change {
 	char type;
 	int	id;
 	int	HP, LEVEL, EXP;
+	int skill1;
+	int skill2;
+	int skill3;
 };
 
 
@@ -78,7 +85,8 @@ struct sc_packet_add_object {
 	int obj_class;		// 1: PLAYER,    2:ORC,  3:Dragon, ¡¦..
 	short x, y;
 	int	HP, LEVEL, EXP;
-
+	int dir;
+	int ani;
 };
 
 
@@ -97,6 +105,8 @@ struct cs_packet_move {
 struct cs_packet_attack {
 	char	size;
 	char	type;
+	char skill_num;
+	char damage;
 };
 
 struct cs_packet_chat {
@@ -108,6 +118,12 @@ struct cs_packet_chat {
 struct cs_packet_logout {
 	char	size;
 	char	type;
+};
+
+struct cs_packet_teleport {
+	char size;
+	char type;
+	short x, y;
 };
 
 #pragma pack (pop)

@@ -1,800 +1,697 @@
-#include <iostream>
-#include <thread>
-#include <mutex>
-#include <vector>
-#include <unordered_set>
-#include <queue>
-#include <chrono>
-
-using namespace std;
-
-#include <winsock2.h>
-
-#include <windows.h>  
-#include <stdio.h>  
-#include <locale.h>
-
-#define UNICODE  
-#include <sqlext.h>  
-
+#include "server.h"
 #include "2019_화목_protocol.h"
 
-#pragma comment(lib, "Ws2_32.lib")
-
-#define MAX_BUFFER        1024
-
-#define START_X		10
-#define START_Y		10
-
-enum ACT
-{
-	SEND = 1, RECV, MOVE
-};
-
-class TIMER_EVENT
-{
-public:
-	int id;
-	std::chrono::high_resolution_clock::time_point exec_time; // 이 이벤트가 언제 실행되야 하는가
-	int job;
-};
-
-class event_comp
-{
-public:
-	event_comp() {}
-	bool operator()(const TIMER_EVENT a, const TIMER_EVENT b)const { return (a.exec_time > b.exec_time); }
-};
-
-struct OVER_EX
-{
-	WSAOVERLAPPED	 overlapped;
-	WSABUF			dataBuffer;
-	char			messageBuffer[MAX_BUFFER];
-	char			act;
-};
-
-class NPC
-{
-public:
-	short x, y;
-	int hp;
-};
-
-class USER : public NPC
-{
-public:
-	mutex	access_lock;
-	bool	connected;
-	bool is_move;
-	OVER_EX over;
-	SOCKET socket;
-	char packet_buf[MAX_BUFFER];
-	int prev_size;
-
-	int level;
-	int exp;
-	std::unordered_set <int> viewlist;
-};
-
-USER clients[NPC_ID_START + NUM_NPC];
+SOCKETINFO clients[NPC_ID_START + NUM_NPC];
 
 HANDLE g_iocp;
 
-std::priority_queue < TIMER_EVENT, std::vector<TIMER_EVENT>, event_comp> timer_queue;
-std::mutex t_lock;
+std::chrono::high_resolution_clock::time_point server_timer;
 
-#define NAME_LEN 10
+int main() 
+{
+	std::vector <std::thread * > worker_threads;
+	std::wcout.imbue(std::locale("korean"));
+	initialize();
+	check_player_level(0);
+	g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, NULL, 0);
+	server_timer = high_resolution_clock::now();
 
-SQLHENV henv;
-SQLHDBC hdbc;
-SQLHSTMT hstmt = 0;
-SQLRETURN retcode;
+	std::thread timer_thread{ do_timer };
+
+	for (int i = 0; i < 6; ++i) {
+		worker_threads.emplace_back(new std::thread{ worker_thread });
+	}
+
+	std::thread accept_tread{ do_accept };
+	timer_thread.join();
+	accept_tread.join();
+	for (auto pth : worker_threads) {
+		pth->join();
+		delete pth;
+	}
+
+	worker_threads.clear();
+	shutdown_server();
+}
+
 
 void initialize()
 {
-	for (int i = 0; i < MAX_USER; ++i) {
-		clients[i].connected = false;
-		clients[i].viewlist.clear();
-	}
-	for (int i = NPC_ID_START; i < NPC_ID_START + NUM_NPC; ++i) {
-		clients[i].connected = true;
-		clients[i].is_move = false;
-		clients[i].x = rand() % WORLD_WIDTH;
-		clients[i].y = rand() % WORLD_HEIGHT;
-	}
+	read_map();
+	init_npc();
+	DB_init();
 
-	setlocale(LC_ALL, "korean");
-	retcode = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
-	if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) {
-		retcode = SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER*)SQL_OV_ODBC3, 0);
-		if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) {
-			retcode = SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
-			if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) {
-				SQLSetConnectAttr(hdbc, SQL_LOGIN_TIMEOUT, (SQLPOINTER)5, 0);
-				retcode = SQLConnect(hdbc, (SQLWCHAR*)L"2016180038_jes", SQL_NTS, (SQLWCHAR*)NULL, 0, NULL, 0);
-				if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO) {
-					printf("DB Access OK!!\n");
-				}
+	for (int i = 0; i < MAX_USER; ++i)
+		clients[i].connected = false;
+}
+
+
+void worker_thread()
+{
+	while (true) 
+	{
+		DWORD io_byte;
+		unsigned long long key;
+		OVER_EX *lpover_ex;
+		BOOL is_error = GetQueuedCompletionStatus(g_iocp, &io_byte, &key, reinterpret_cast<LPWSAOVERLAPPED *>(&lpover_ex), INFINITE);
+
+		if (FALSE == is_error) 
+		{
+			int err_no = WSAGetLastError();
+			if (err_no != 64)
+				error_display("GQCS : ", WSAGetLastError());
+			else
+			{
+				disconnect(static_cast<int>(key));
 			}
 		}
+		if (0 == io_byte) {
+			disconnect(static_cast<int>(key));
+			continue;
+		}
+
+		if (EV_RECV == lpover_ex->event) {
+			int rest_size = io_byte;
+			char *ptr = lpover_ex->messageBuffer;
+			char packet_size = 0;
+			if (0 < clients[key].prev_size) packet_size = clients[key].packet_buf[0];
+			while (rest_size > 0)
+			{
+				if (0 == packet_size)packet_size = ptr[0];
+				int required = packet_size - clients[key].prev_size;
+				if (rest_size >= required)
+				{
+					memcpy(clients[key].packet_buf + clients[key].prev_size, ptr, required);
+					process_packet(static_cast<int>(key), clients[key].packet_buf);
+					rest_size -= required;
+					ptr += required;
+					packet_size = 0;
+				}
+				else
+				{
+					memcpy(clients[key].packet_buf + clients[key].prev_size, ptr, rest_size);
+					rest_size = 0;
+				}
+			}
+			do_recv(static_cast<int>(key));
+		}
+		else if (EV_SEND == lpover_ex->event) {
+			//if (io_byte != lpover_ex->dataBuffer.len) { // 같아야 되는데 다르므로 
+			//	closesocket(clients[key].socket);
+			//	clients[key].connected = false;
+			//	exit(-1);
+			//}
+			delete lpover_ex;
+		}
+		else if (EV_DO_AI == lpover_ex->event) {
+			check_npc_hp(key);
+			if (clients[key].level != 0 && clients[key].npc_chase_player == -1) {
+				random_move_npc(key);
+			}
+			delete lpover_ex;
+		}
+		else if (EV_PLAYER_MOVE == lpover_ex->event) {
+			clients[key].v_lock.lock();
+			lua_State *L = clients[key].L;
+			lua_getglobal(L, "event_player_move");
+			lua_pushnumber(L, lpover_ex->event_from);
+			if (0 != lua_pcall(L, 1, 0, 0)) {
+				std::cout << "LUA error calling [event_player_move] : " << (char *)lua_tostring(L, -1) << std::endl;
+			}
+			clients[key].v_lock.unlock();
+			delete lpover_ex;
+		}
+		else if (EV_MONSTER_ATTACK_MOVE == lpover_ex->event) {
+			//printf( "NPC[%d] Move Client[%d]\t", ci, g_clients[ci].npc_Client );
+			move_npc_to_player(clients[key].npc_chase_player, key);
+			delete lpover_ex;
+		}
+		else if (EV_RESPAWN == lpover_ex->event) {
+			respawn_npc(key);
+			delete lpover_ex;
+		}
 	}
 }
 
-void DB_SQL_GET_STATUS(wchar_t *id)
-{
-	retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
-	SQLCHAR UserId;
-	SQLINTEGER UserX, UserY, UserEXP, UserLEVEL, UserHP;
-	SQLLEN cbUserId = 0, cbUserX = 0, cbUserY = 0, cbUserEXP = 0, cbUserLEVEL = 0, cbUserHP = 0;// 
-	WCHAR Query[MAX_BUFFER];
+void do_accept() {
 
-	wsprintf((LPWSTR)Query, L"SELECT posX, posY, hp, lev, exp FROM user_table WHERE id = %s", id);
-	retcode = SQLExecDirect(hstmt, (SQLWCHAR *)Query, SQL_NTS);
+	WSADATA	wsadata;
+	WSAStartup(MAKEWORD(2, 2), &wsadata);
 
-	retcode = SQLBindCol(hstmt, 1, SQL_C_LONG, &UserX, 100, &cbUserX);// 
-	retcode = SQLBindCol(hstmt, 2, SQL_C_LONG, &UserY, 100, &cbUserY);//인티져니까 sLevel에 &
 
-	retcode = SQLFetch(hstmt);
+	SOCKET listensocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 
-	clients[id].x = UserX;
-	clients[id].y = UserY;
+	SOCKADDR_IN ServerAddr;
+	ZeroMemory(&ServerAddr, sizeof(SOCKADDR_IN));
+	ServerAddr.sin_family = AF_INET;
+	ServerAddr.sin_port = htons(SERVER_PORT);
+	ServerAddr.sin_addr.s_addr = INADDR_ANY;
+
+
+	bind(listensocket, reinterpret_cast<sockaddr *>(&ServerAddr), sizeof(ServerAddr));
+	listen(listensocket, 5);
+
+
+	SOCKADDR_IN ClientAddr;
+	memset(&ClientAddr, 0, sizeof(SOCKADDR_IN));
+	ClientAddr.sin_family = PF_INET;
+	ClientAddr.sin_port = htons(SERVER_PORT);
+	ClientAddr.sin_addr.s_addr = INADDR_ANY;
+	int addr_size = sizeof(ClientAddr);
+	SOCKET new_client;
+	while (true) {
+		new_client = accept(listensocket, (struct sockaddr *)&ClientAddr, &addr_size);
+		if (INVALID_SOCKET == new_client) {
+			int err_no = WSAGetLastError();
+			//error_display("WSAAccept : ", err_no);
+		}
+
+		int new_id = -1;
+
+		for (int i = 0; i < MAX_USER; ++i) {
+			if (clients[i].connected == false) {
+				new_id = i;
+			}
+		}
+
+		if (-1 == new_id) {
+			closesocket(new_client);
+			continue;
+		}
+
+		char  buf[255];
+		int retval = recv(new_client, buf, 10, 0);
+		if (retval == SOCKET_ERROR) {
+			std::cout << "Not Recv Game_ID : " << new_id << std::endl;
+			closesocket(new_client);
+			continue;
+		}
+		buf[retval] = '\0';
+
+		strcpy(clients[new_id].nickname, buf);
+		int is_accept = DB_get_info(new_id);
+		if (is_accept == DB_Success&& db_connect == 0) {
+			strcpy(buf, "Okay");
+			retval = send(new_client, buf, strlen(buf), 0);
+		}
+		else if (is_accept == DB_NoConnect) {
+			strcpy(buf, "False");
+			retval = send(new_client, buf, strlen(buf), 0);
+		}
+		else if (db_connect == 1) {
+			strcpy(buf, "Overlap");
+			retval = send(new_client, buf, strlen(buf), 0);
+			closesocket(new_client);
+			continue;
+		}
+		else if (is_accept == DB_NoData) {
+			strcpy(buf, "Newid");
+			clients[new_id].x = START_X;
+			clients[new_id].y = START_Y;
+			clients[new_id].exp = 0;
+			clients[new_id].level = 1;
+			clients[new_id].hp = 100;
+			clients[new_id].max_hp = clients[new_id].hp;
+			DB_new_id(new_id);
+			DB_get_info(new_id);
+			retval = send(new_client, buf, strlen(buf), 0);
+		}
+		//---------------------------------------------------------------------------------------------------------------------------------------------------
+		// 들어온 접속 아이디 init 처리
+		std::cout << "id : " << new_id << std::endl;
+		clients[new_id].connected = true;
+		clients[new_id].socket = new_client;
+		clients[new_id].prev_size = 0;
+		ZeroMemory(&clients[new_id].over.overlapped, sizeof(WSAOVERLAPPED));
+		clients[new_id].over.event = EV_RECV;
+		clients[new_id].over.dataBuffer.len = MAX_BUFFER;
+		clients[new_id].over.dataBuffer.buf = clients[new_id].over.messageBuffer;
+		clients[new_id].x = dbX;
+		clients[new_id].y = dbY;
+		clients[new_id].level = dbLevel;
+		clients[new_id].skill_1 = dbSkill[0];
+		clients[new_id].skill_2 = dbSkill[1];
+		clients[new_id].skill_3 = dbSkill[2];
+		clients[new_id].hp_timer = 0;
+		clients[new_id].hp = dbHP;
+		clients[new_id].max_hp = dbMaxHP;
+		clients[new_id].dir = 2;
+		clients[new_id].ani = 0;
+		//---------------------------------------------------------------------------------------------------------------------------------------------------
+		DWORD recv_flag = 0;
+		CreateIoCompletionPort(reinterpret_cast<HANDLE>(new_client), g_iocp, new_id, 0);
+		int ret = WSARecv(new_client, &clients[new_id].over.dataBuffer, 1, NULL, &recv_flag, &clients[new_id].over.overlapped, NULL);
+
+		if (0 != ret) {
+			int error_no = WSAGetLastError();
+			if (WSA_IO_PENDING != error_no) {
+				//error_display("RecvPacket:WSARecv", error_no);
+				//while ( true );
+			}
+		}
+
+		send_add_object_packet(new_id, new_id);
+
+		std::unordered_set<int> local_view_list;
+		for (int i = 0; i < NPC_ID_START + NUM_NPC; ++i)
+			if (clients[i].connected == true)
+				if (i != new_id)
+					if (distance(i, new_id, VIEW_RADIUS) == true) {
+						local_view_list.insert(i);
+						send_add_object_packet(new_id, i);
+
+						if (is_npc(i))
+							wake_up_npc(i);
+
+						if (clients[i].connected == false)
+							continue;
+
+						clients[i].v_lock.lock();
+						if (clients[i].viewlist.count(new_id) == 0) {
+							clients[i].viewlist.insert(new_id);
+							clients[i].v_lock.unlock();
+							send_add_object_packet(i, new_id);
+						}
+						else clients[i].v_lock.unlock();
+					}
+		clients[new_id].v_lock.lock();
+		for (auto p : local_view_list) clients[new_id].viewlist.insert(p);
+		clients[new_id].v_lock.unlock();
+	}
 }
 
-void DB_SQL_SET_POS(int id)
+void shutdown_server() 
 {
-	retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
-	SQLINTEGER UserId, UserX, UserY;
-	SQLLEN cbUserId = 0, cbUserX = 0, cbUserY = 0;// 
-	WCHAR Query[MAX_BUFFER];
-
-	wsprintf((LPWSTR)Query, L"UPDATE user_table SET posX = %d, posY = %d WHERE id = %d", clients[id].x, clients[id].y, id);
-	retcode = SQLExecDirect(hstmt, (SQLWCHAR *)Query, SQL_NTS);
+	for (int i = NPC_ID_START; i < NPC_ID_START + NUM_NPC; ++i)
+		lua_close(clients[i].L);
+	CloseHandle(g_iocp);
 }
 
-int get_new_id()
-{
+void disconnect(int id) {
 	for (int i = 0; i < MAX_USER; ++i)
-		if (clients[i].connected == false) {
-			clients[i].connected = true;
-			return i;
-		}
-	return -1;
-}
-
-bool is_near_object(int a, int b)
-{
-	if (VIEW_RADIUS < abs(clients[a].x - clients[b].x))
-		return false;
-	if (VIEW_RADIUS < abs(clients[a].y - clients[b].y))
-		return false;
-	return true;
-}
-
-void error_display(const char *msg, int err_no)
-{
-	WCHAR *lpMsgBuf;
-	FormatMessage(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER |
-		FORMAT_MESSAGE_FROM_SYSTEM,
-		NULL, err_no,
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPTSTR)&lpMsgBuf, 0, NULL);
-	cout << msg;
-	wcout << L"에러 " << lpMsgBuf << endl;
-	while (true);
-	LocalFree(lpMsgBuf);
-}
-
-void HandleDiagnosticRecord(SQLHANDLE hHandle, SQLSMALLINT hType, RETCODE RetCode)
-{
-	SQLSMALLINT iRec = 0;
-	SQLINTEGER iError;
-	WCHAR wszMessage[1000];
-	WCHAR wszState[SQL_SQLSTATE_SIZE + 1];
-	if (RetCode == SQL_INVALID_HANDLE) {
-		fwprintf(stderr, L"Invalid handle!\n");
-		return;
-	}
-	while (SQLGetDiagRecW(hType, hHandle, ++iRec, wszState, &iError, wszMessage, (SQLSMALLINT)(sizeof(wszMessage) / sizeof(WCHAR)), (SQLSMALLINT *)NULL) == SQL_SUCCESS)
 	{
-		//Hide data truncated..
-		if (wcsncmp(wszState, L"01004", 5))
-		{
-			fwprintf(stderr, L"[%5.5s] %s (%d) \n", wszState, wszMessage, iError);
-		}
-	}
-}
-
-void add_timer(int id, int job, std::chrono::high_resolution_clock::time_point t)
-{
-	t_lock.lock();
-	timer_queue.push(TIMER_EVENT{ id, t, job });
-	t_lock.unlock();
-}
-
-void wake_up_npc(int id)
-{
-	if (true == clients[id].is_move) return;
-	clients[id].is_move = true;
-	add_timer(id, 0, std::chrono::high_resolution_clock::now() + std::chrono::seconds(1));
-}
-
-void send_packet(int key, char *packet)
-{
-	SOCKET client_s = clients[key].socket;
-
-	OVER_EX *over = reinterpret_cast<OVER_EX *>(malloc(sizeof(OVER_EX)));
-
-	over->act = ACT::SEND;
-	over->dataBuffer.buf = over->messageBuffer;
-	over->dataBuffer.len = packet[0];
-	memcpy(over->messageBuffer, packet, packet[0]);
-	ZeroMemory(&(over->overlapped), sizeof(WSAOVERLAPPED));
-	if (WSASend(client_s, &over->dataBuffer, 1, NULL,
-		0, &(over->overlapped), NULL) == SOCKET_ERROR)
-	{
-		if (WSAGetLastError() != WSA_IO_PENDING)
-		{
-			cout << "Error - Fail WSASend(error_code : ";
-			cout << WSAGetLastError() << ")\n";
-		}
-	}
-}
-
-void send_login_ok_packet(int to)
-{
-	sc_packet_login_ok packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_LOGIN_OK;
-	packet.id = to;
-	packet.x = clients[to].x;
-	packet.y = clients[to].y;
-	packet.HP = clients[to].hp;
-	packet.LEVEL = clients[to].level;
-	packet.EXP = clients[to].exp;
-	send_packet(to, reinterpret_cast<char *>(&packet));
-}
-
-void send_login_fail_packet(int to, wchar_t *message)
-{
-	sc_packet_login_fail packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_LOGIN_FAIL;
-	wcsncpy_s(packet.message, message, MAX_STR_LEN);
-	send_packet(to, reinterpret_cast<char *>(&packet));
-}
-
-void send_position_packet(int to, int obj)
-{
-	sc_packet_position packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_POSITION;
-	packet.id = obj;
-	packet.x = clients[obj].x;
-	packet.y = clients[obj].y;
-	send_packet(to, reinterpret_cast<char *>(&packet));
-}
-
-void send_chat_packet(int to, wchar_t *from, wchar_t *message)
-{
-	sc_packet_chat packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_CHAT;
-	wcsncpy_s(packet.id, from, 10);
-	wcsncpy_s(packet.message, message, MAX_STR_LEN);
-	send_packet(to, reinterpret_cast<char*>(&packet));
-}
-
-void send_stat_change_packet(int to, int obj, int hp, int level, int exp)
-{
-	sc_packet_stat_change packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_STAT_CHANGE;
-	packet.id = obj;
-	packet.HP = hp;
-	packet.LEVEL = level;
-	packet.EXP = exp;
-	send_packet(to, reinterpret_cast<char*>(&packet));
-}
-
-void send_add_object_packet(int to, int obj, int obj_class)
-{
-	sc_packet_add_object packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_ADD_OBJECT;
-	packet.id = obj;
-	packet.obj_class = obj_class;
-	packet.HP;
-	packet.LEVEL;
-	packet.EXP;
-	packet.x;
-	packet.y;
-	send_packet(to, reinterpret_cast<char*>(&packet));
-}
-
-void send_remove_object_packet(int to, int obj)
-{
-	sc_packet_remove_object packet;
-	packet.size = sizeof(packet);
-	packet.type = SC_REMOVE_OBJECT;
-	packet.id = obj;
-	send_packet(to, reinterpret_cast<char*>(&packet));
-}
-void disconnect(int id)
-{
-	for (int i = 0; i < MAX_USER; ++i) {
 		if (false == clients[i].connected) continue;
-		clients[i].access_lock.lock();
-		if (0 != clients[i].viewlist.count(id))	// 접속유저 전체 돌면서 뷰리스트 안에 id 있을때
+		clients[i].v_lock.lock();
+		if (0 != clients[i].viewlist.count(id))
 		{
 			clients[i].viewlist.erase(id);
-			clients[i].access_lock.unlock();
-			send_remove_player_packet(i, id);
+			clients[i].v_lock.unlock();
+			send_remove_object_packet(i, id);
 		}
 		else
 		{
-			clients[i].access_lock.unlock();
+			clients[i].v_lock.unlock();
 		}
 	}
 	closesocket(clients[id].socket);
+	clients[id].v_lock.lock();//LOCK
 	clients[id].viewlist.clear();
+	clients[id].v_lock.unlock();//UNLOCK
 	clients[id].connected = false;
+	std::cout << "Disconnect Client : " << id << std::endl;
 }
 
-void move_npc(int id)
-{
-	int x = clients[id].x;
-	int y = clients[id].y;
-	switch (rand() % 4) {
-	case 0: if (x > 0) x--; break;
-	case 1: if (x < WORLD_WIDTH - 1) x++; break;
-	case 2: if (y > 0) y--; break;
-	case 3: if (y < WORLD_HEIGHT - 1) y++; break;
-	}
-	clients[id].x = x;
-	clients[id].y = y;
-
-	for (int i = 0; i < MAX_USER; ++i)
+void process_packet(int ci, char *packet) {
+	switch (packet[1]) {
+	case CS_MOVE:
 	{
-		if (false == clients[i].connected) continue;
-		if (true == is_near_object(i, id)) {
-			clients[i].access_lock.lock();
-			if (0 == clients[i].viewlist.count(id)) {
-				clients[i].viewlist.insert(id);
-				clients[i].access_lock.unlock();
-				send_put_player_packet(i, id);
-			}
-			else {
-				clients[i].access_lock.unlock();
-				send_pos_packet(i, id);
-			}
-		}
-		else { // 시야에 없다
-			clients[i].access_lock.lock();
-			if (0 == clients[i].viewlist.count(id)) {
-				clients[i].access_lock.unlock();
-			}
-			else {
-				clients[i].viewlist.erase(id);
-				clients[i].access_lock.unlock();
-				send_remove_player_packet(i, id);
-			}
-		}
-	}
-}
-
-void process_packet(int id, char * buf)
-{
-	cs_packet_up *packet = reinterpret_cast<cs_packet_up *>(buf);
-
-	short x = clients[id].x;
-	short y = clients[id].y;
-	switch (packet->type) {
-	case CS_UP:
-		--y;
-		if (y < 0) y = 0;
-		break;
-	case CS_DOWN:
-		++y;
-		if (y >= WORLD_HEIGHT) y = WORLD_HEIGHT;
-		break;
-	case CS_LEFT:
-		if (0 < x) x--;
-		break;
-	case CS_RIGHT:
-		if (WORLD_WIDTH > x) x++;
-		break;
-	default:
-		cout << "Unknown Packet Type Error\n";
-		while (true);
-	}
-	clients[id].x = x;
-	clients[id].y = y;
-
-	send_pos_packet(id, id);
-
-	clients[id].access_lock.lock();
-	unordered_set <int> old_vl = clients[id].viewlist;
-	clients[id].access_lock.unlock();
-	unordered_set <int> new_vl;
-
-	for (int i = 0; i < MAX_USER; ++i) {
-		if ((true == clients[i].connected) && (true == is_near_object(id, i)) && (i != id))
-			new_vl.insert(i);
-	}
-
-	for (int i = 0; i < NUM_NPC; ++i) // 엔피씨 뷰리스트에 넣기
-	{
-		int npc_id = i + NPC_ID_START;
-		if (true == is_near_object(npc_id, id))
+		cs_packet_move *my_packet = reinterpret_cast<cs_packet_move *>(packet);
+		switch (my_packet->direction)
 		{
-			new_vl.insert(npc_id);
+		case 0:
+			clients[ci].dir = 0;
+			if (clients[ci].y > 0 && collision_check(ci, 0)) {
+				clients[ci].y--;
+				clients[ci].ani += 1;
+				clients[ci].last_move_time = std::chrono::high_resolution_clock::now();
+			}
+			break;
+		case 1:
+			clients[ci].dir = 1;
+			if (clients[ci].y < WORLD_HEIGHT - 1 && collision_check(ci, 1)) {
+				clients[ci].y++;
+				clients[ci].ani += 1;
+				clients[ci].last_move_time = std::chrono::high_resolution_clock::now();
+			}
+			break;
+		case 2:
+			clients[ci].dir = 2;
+			if (clients[ci].x > 0 && collision_check(ci, 2)) {
+				clients[ci].x--;
+				clients[ci].ani += 1;
+				clients[ci].last_move_time = std::chrono::high_resolution_clock::now();
+			}
+			break;
+		case 3:
+			clients[ci].dir = 3;
+			if (clients[ci].x < WORLD_WIDTH - 1 && collision_check(ci, 3)) {
+				clients[ci].x++;
+				clients[ci].ani += 1;
+				clients[ci].last_move_time = std::chrono::high_resolution_clock::now();
+			}
+			break;
 		}
+
+	}
+	break;
+	case CS_ATTACK:
+	{//printf( "%d가 공격 %d만큼\n",ci, my_packet->damage );
+		cs_packet_attack *my_packet = reinterpret_cast<cs_packet_attack *>(packet);
+		check_attack(ci, packet);
+	}
+	break;
+	case CS_TELEPORT:
+	{	//printf( "%d가 공격 %d만큼\n",ci, my_packet->damage );
+		cs_packet_attack *my_packet = reinterpret_cast<cs_packet_attack *>(packet);
+		player_teleport(ci, packet);
+	}
+	break;
+	default:
+		exit(-1);
 	}
 
-	for (auto cl : new_vl) {
-		if (0 == old_vl.count(cl)) {
-			send_put_player_packet(id, cl);
-			clients[id].access_lock.lock();
-			clients[id].viewlist.insert(cl);
-			clients[id].access_lock.unlock();
-			if (cl >= NPC_ID_START) {
-				wake_up_npc(cl);
-			}
-		}
+	if (clients[ci].ani >= 2) clients[ci].ani = 0; // 움직임은 0~2까지 있다.
 
-		if (cl >= NPC_ID_START) continue;
-		clients[cl].access_lock.lock();
-		if (0 != clients[cl].viewlist.count(id)) {
-			clients[cl].access_lock.unlock();
-			send_pos_packet(cl, id);
+	send_position_packet(ci, ci); // 자기 자신한테 안보내줘서
+
+	std::unordered_set<int> new_view_list;
+	for (int i = 0; i < MAX_USER; ++i)
+		if (clients[i].connected == true)
+			if (i != ci) {
+				// 자기 자신은 넣으면 안된다.
+				if (true == distance(ci, i, VIEW_RADIUS))
+					new_view_list.insert(i);
+			}
+
+	//------------------------------------------------------------------------------
+	for (int i = NPC_ID_START; i < NPC_ID_START + NUM_NPC; ++i)
+		if (distance(ci, i, VIEW_RADIUS) == true) new_view_list.insert(i);
+	//------------------------------------------------------------------------------
+
+	// 새로 추가되는 객체
+	std::unordered_set<int> vlc;
+	clients[ci].v_lock.lock();
+	vlc = clients[ci].viewlist;
+	clients[ci].v_lock.unlock();
+
+	for (auto target : new_view_list)
+		if (vlc.count(target) == 0) {
+			// 새로 추가되는 객체
+			send_add_object_packet(ci, target);
+			vlc.insert(target);
+
+			if (is_npc(target) == true)
+				wake_up_npc(target);
+
+			if (true != is_player(target)) continue;
+
+			clients[target].v_lock.lock();
+			if (clients[target].viewlist.count(ci) == 0) {
+				clients[target].viewlist.insert(ci);
+				clients[target].v_lock.unlock();
+				send_add_object_packet(target, ci);
+			}
+			else {
+				clients[target].v_lock.unlock();
+				send_position_packet(target, ci);
+			}
+
 		}
 		else {
-			clients[cl].viewlist.insert(id);
-			clients[cl].access_lock.unlock();
-			send_put_player_packet(cl, id);
-		}
-	}
+			// 변동없이 존재하는 객체
+			if (is_npc(target) == true) continue;
+			// npc는 처리할 필요가 없다.
 
-	for (auto cl : old_vl) {
-		if (0 == new_vl.count(cl)) {
-			// 시야에서 사라진 플레이어
-			clients[id].access_lock.lock();
-			clients[id].viewlist.erase(cl);
-			clients[id].access_lock.unlock();
-			send_remove_player_packet(id, cl);
-
-			if (cl >= NPC_ID_START) continue;
-			clients[cl].access_lock.lock();
-			if (0 != clients[cl].viewlist.count(id)) {
-				clients[cl].viewlist.erase(id);
-				clients[cl].access_lock.unlock();
-				send_remove_player_packet(cl, id);
+			clients[target].v_lock.lock();
+			if (0 != clients[target].viewlist.count(ci)) {
+				clients[target].v_lock.unlock();
+				send_position_packet(target, ci);
 			}
 			else {
-				clients[cl].access_lock.unlock();
+				clients[target].viewlist.insert(ci);
+				clients[target].v_lock.unlock();
+				send_add_object_packet(target, ci);
+			}
+		}
+
+	// 시야에서 멀어진 객체
+	std::unordered_set<int> removed_id_list;
+	for (auto target : vlc) // 전에는 있었는데
+		if (new_view_list.count(target) == 0) { //새로운 리스트에는 없다.
+			removed_id_list.insert(target);
+			send_remove_object_packet(ci, target);
+
+			if (is_npc(target) == true) continue;
+			// npc는 필요 없다.
+
+			clients[target].v_lock.lock();
+			if (0 != clients[target].viewlist.count(ci)) {
+				clients[target].viewlist.erase(ci);
+				clients[target].v_lock.unlock();
+				send_remove_object_packet(target, ci);
+			}
+			else {
+				clients[target].v_lock.unlock();
+			}
+		}
+
+	clients[ci].v_lock.lock();
+	for (auto p : vlc)
+		clients[ci].viewlist.insert(p);
+	for (auto d : removed_id_list)
+		clients[ci].viewlist.erase(d);
+	clients[ci].v_lock.unlock();
+
+	for (auto npc : new_view_list) {
+		if (false == is_npc(npc)) continue;
+		OVER_EX *over = new OVER_EX;
+		over->event = EV_PLAYER_MOVE;
+		over->event_from = ci;
+		PostQueuedCompletionStatus(g_iocp, 1, npc, &over->overlapped);
+	}
+}
+
+void do_timer() {
+	for (;;) {
+		Sleep(10);
+		for (;;) {
+			if (high_resolution_clock::now() - server_timer >= 1s) {
+				check_player_hp();
+				server_timer = high_resolution_clock::now();
+			}
+			timer_lock.lock();
+			if (0 == timer_queue.size()) {
+				timer_lock.unlock();
+				break;
+			} 
+			T_EVENT t = timer_queue.top(); // 여러 이벤트 중에 실행시간이 제일 최근인 이벤트를 실행해야 하므로 우선순위 큐를 만듬
+			if (t.start_time > high_resolution_clock::now()) {
+				timer_lock.unlock();
+				break; // 현재시간보다 크다면, 기다려줌
+			}
+			timer_queue.pop();
+			timer_lock.unlock();
+			OVER_EX *over = new OVER_EX;
+			if (EV_MOVE == t.event_type) {
+				over->event = EV_DO_AI;
+			}
+			if (EV_MONSTER_ATTACK_MOVE == t.event_type) {
+				over->event = EV_MONSTER_ATTACK_MOVE;
+			}
+			if (EV_RESPAWN == t.event_type) {
+				over->event = EV_RESPAWN;
+			}
+			PostQueuedCompletionStatus(g_iocp, 1, t.do_object, &over->overlapped);
+		}
+	}
+}
+
+bool is_player(int ci) {
+	if (ci < MAX_USER) return true;
+	else return false;
+}
+
+bool is_npc(int id) {
+	if ((id >= NPC_ID_START) && (id < NPC_ID_START + NUM_NPC)) return true;
+	else return false;
+}
+
+void check_player_hp() {
+	for (int ci = 0; ci < MAX_USER; ++ci) {
+		if (clients[ci].connected == false) continue;
+		if (clients[ci].hp <= 0) {
+			// HP가 0이 되었을경우 초기 위치로 이동 & 위치 보내주기
+			clients[ci].x = START_X;
+			clients[ci].y = START_Y;
+			clients[ci].hp = clients[ci].max_hp;
+			clients[ci].exp /= 2;
+			send_position_packet(ci, ci);
+		}
+		if (clients[ci].skill_1 != 0)  clients[ci].skill_1 -= 1;
+		if (clients[ci].skill_2 != 0)  clients[ci].skill_2 -= 1;
+		if (clients[ci].skill_3 != 0)  clients[ci].skill_3 -= 1;
+
+		DB_set_info(ci);
+
+		//5초마다 10% hp 회복
+		if (clients[ci].hp_timer >= 5) {
+			clients[ci].hp_timer = 0;
+			if (clients[ci].max_hp <= clients[ci].hp + (clients[ci].max_hp % 10)) {
+				clients[ci].hp = clients[ci].max_hp;
+			}
+			else {
+				clients[ci].hp += clients[ci].max_hp % 10;
+			}
+		}
+		clients[ci].hp_timer += 1;
+
+
+		check_player_level(ci);
+		send_stat_change_packet(ci, ci);
+	}
+}
+
+void check_player_level(int ci) 
+{
+	// 1레벨 100
+	// 2레벨 200
+	// 3레벨 400
+	unsigned long long exp_data = 100;
+
+	//for ( int i = 1; i < 50; ++i ) {
+	//	printf( "%d레벨 : %lld\n", i , exp_data );
+	//	exp_data += exp_data;
+	//}
+
+	for (int i = 1; i < clients[ci].level; ++i) {
+		exp_data += exp_data;
+	}
+
+	if (clients[ci].exp >= exp_data) {
+		clients[ci].exp = 0;
+		clients[ci].max_hp += (clients[ci].level * 20);
+		clients[ci].hp = clients[ci].max_hp;
+		clients[ci].level += 1;
+	}
+
+}
+
+void player_teleport(int ci, char * ptr) 
+{
+	cs_packet_teleport *my_packet = reinterpret_cast<cs_packet_teleport *>(ptr);
+	clients[ci].x = my_packet->x;
+	clients[ci].y = my_packet->y;
+
+	send_position_packet(ci, ci);
+}
+
+void error_display(const char *msg, int err_no) {
+	LPVOID lpMsgBuf;
+	FormatMessage(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+		NULL, err_no,
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+		(LPTSTR)&lpMsgBuf, 0, NULL);
+	printf("[%s] %s\n", msg, (char *)lpMsgBuf);
+	LocalFree(lpMsgBuf);
+}
+
+void send_packet(int key, void *packet) {
+	if (clients[key].connected == true) {
+		int psize = reinterpret_cast<char *>(packet)[0];
+		OVER_EX *over = new OVER_EX;
+		ZeroMemory(&over->overlapped, sizeof(WSAOVERLAPPED));
+		over->event = EV_SEND;
+		memcpy(over->messageBuffer, packet, psize);
+		over->dataBuffer.len = psize;
+		over->dataBuffer.buf = over->messageBuffer;
+		int res = WSASend(clients[key].socket, &over->dataBuffer, 1, NULL, 0, &over->overlapped, NULL);
+		if (0 != res) {
+			int error_no = WSAGetLastError();
+			if (WSA_IO_PENDING != error_no) {
+				error_display("SendPacket:WSASend", error_no);
+				disconnect(key);
 			}
 		}
 	}
+}
+
+void send_chat_packet(int to, int from, wchar_t *message) 
+{
+	sc_packet_chat packet;
+	packet.id = from;
+	packet.size = sizeof(packet);
+	packet.type = SC_CHAT;
+	wcsncpy_s(packet.message, message,MAX_STR_LEN);
+	send_packet(to, reinterpret_cast<void *>(&packet));
+}
+
+void send_stat_change_packet(int client, int object) {
+	sc_packet_stat_change packet;
+	packet.id = object;
+	packet.size = sizeof(packet);
+	packet.type = SC_STAT_CHANGE;
+	packet.HP = clients[object].hp;
+	packet.LEVEL = clients[object].level;
+	packet.EXP = clients[object].exp;
+	packet.skill1 = clients[object].skill_1;
+	packet.skill2 = clients[object].skill_2;
+	packet.skill3 = clients[object].skill_3;
+	send_packet(client, &packet);
+}
+
+void send_add_object_packet(int client, int object) {
+	sc_packet_add_object packet;
+	packet.id = object;
+	packet.size = sizeof(packet);
+	packet.type = SC_ADD_OBJECT;
+	packet.x = clients[object].x;
+	packet.y = clients[object].y;
+	packet.dir = clients[object].dir;
+	packet.ani = clients[object].ani;
+
+	send_stat_change_packet(client, object);
+	send_packet(client, &packet);
+}
+
+void send_position_packet(int client, int object) {
+	sc_packet_position packet;
+	packet.id = object;
+	packet.size = sizeof(packet);
+	packet.type = SC_POSITION;
+	packet.x = clients[object].x;
+	packet.y = clients[object].y;
+	packet.dir = clients[object].dir;
+	packet.ani = clients[object].ani;
+	send_stat_change_packet(client, object);
+	send_packet(client, &packet);
+}
+
+void send_remove_object_packet(int client, int object) {
+	sc_packet_remove_object packet;
+	packet.id = object;
+	packet.size = sizeof(packet);
+	packet.type = SC_REMOVE_OBJECT;
+
+	send_packet(client, &packet);
 }
 
 void do_recv(int id)
 {
 	DWORD flags = 0;
 
-	SOCKET client_s = clients[id].socket;
+	SOCKET clients_s = clients[id].socket;
 	OVER_EX *over = &clients[id].over;
 
 	over->dataBuffer.len = MAX_BUFFER;
 	over->dataBuffer.buf = over->messageBuffer;
 	ZeroMemory(&(over->overlapped), sizeof(WSAOVERLAPPED));
-	if (WSARecv(client_s, &over->dataBuffer, 1, NULL,
-		&flags, &(over->overlapped), NULL) == SOCKET_ERROR)
+	if (WSARecv(clients_s, &over->dataBuffer, 1, NULL, &flags, &(over->overlapped), NULL) == SOCKET_ERROR)
 	{
 		int err_no = WSAGetLastError();
 		if (err_no != WSA_IO_PENDING)
 		{
-			error_display("RECV ERROR", err_no);
+			error_display("RECV_ERROR", err_no);
 		}
 	}
 }
-
-void worker_thread()
-{
-	while (true) {
-		DWORD io_byte;
-		ULONG key;
-		OVER_EX *lpover_ex;
-		BOOL is_error = GetQueuedCompletionStatus(g_iocp, &io_byte, &key,
-			reinterpret_cast<LPWSAOVERLAPPED *>(&lpover_ex), INFINITE);
-
-		if (FALSE == is_error)
-		{
-			int err_no = WSAGetLastError();
-			if (64 != err_no)
-				error_display("GQCS ", err_no);
-			else {
-				disconnect(key);
-				continue;
-			}
-		}
-		if (0 == io_byte) {
-			disconnect(key);
-			continue;
-		}
-
-		if (lpover_ex->act == ACT::RECV) {
-			int rest_size = io_byte;
-			char *ptr = lpover_ex->messageBuffer;
-			char packet_size = 0;
-			if (0 < clients[key].prev_size)
-				packet_size = clients[key].packet_buf[0];
-			while (rest_size > 0) {
-				if (0 == packet_size)
-					packet_size = ptr[0];
-				int required = packet_size - clients[key].prev_size;
-				if (rest_size >= required) {
-					memcpy(clients[key].packet_buf + clients[key].prev_size, ptr, required);
-					process_packet(key, clients[key].packet_buf);
-					rest_size -= required;
-					ptr += required;
-					packet_size = 0;
-				}
-				else {
-					memcpy(clients[key].packet_buf + clients[key].prev_size,
-						ptr, rest_size);
-					rest_size = 0;
-				}
-			}
-			do_recv(key);
-		}
-		else if (lpover_ex->act == ACT::SEND)
-		{
-			delete lpover_ex;
-		}
-		else if (lpover_ex->act == ACT::MOVE)
-		{
-			move_npc(key);
-			bool player_exist = false;
-			for (int i = 0; i < MAX_USER; ++i)
-			{
-				if (is_near_object(i, key))
-				{
-					player_exist = true;
-					break;
-				}
-			}
-			if (player_exist)
-				add_timer(key, 0, std::chrono::high_resolution_clock::now() + std::chrono::seconds(1));
-			else
-				clients[key].is_move = false;
-
-			delete lpover_ex;
-		}
-		else {
-			//delete lpover_ex;
-		}
-	}
-}
-
-void do_accept()
-{
-	// Winsock Start - windock.dll 로드
-	WSADATA WSAData;
-	if (WSAStartup(MAKEWORD(2, 2), &WSAData) != 0)
-	{
-		cout << "Error - Can not load 'winsock.dll' file\n";
-		return;
-	}
-
-	// 1. 소켓생성  
-	SOCKET listenSocket = WSASocketW(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if (listenSocket == INVALID_SOCKET)
-	{
-		cout << "Error - Invalid socket\n";
-		return;
-	}
-
-	// 서버정보 객체설정
-	SOCKADDR_IN serverAddr;
-	memset(&serverAddr, 0, sizeof(SOCKADDR_IN));
-	serverAddr.sin_family = PF_INET;
-	serverAddr.sin_port = htons(SERVER_PORT);
-	serverAddr.sin_addr.S_un.S_addr = htonl(INADDR_ANY);
-
-	// 2. 소켓설정
-	if (::bind(listenSocket, (struct sockaddr*)&serverAddr, sizeof(SOCKADDR_IN)) == SOCKET_ERROR)
-	{
-		cout << "Error - Fail bind\n";
-		// 6. 소켓종료
-		closesocket(listenSocket);
-		// Winsock End
-		WSACleanup();
-		return;
-	}
-
-	// 3. 수신대기열생성
-	if (listen(listenSocket, 5) == SOCKET_ERROR)
-	{
-		cout << "Error - Fail listen\n";
-		// 6. 소켓종료
-		closesocket(listenSocket);
-		// Winsock End
-		WSACleanup();
-		return;
-	}
-
-	SOCKADDR_IN clientAddr;
-	int addrLen = sizeof(SOCKADDR_IN);
-	memset(&clientAddr, 0, addrLen);
-	SOCKET clientSocket;
-	DWORD flags;
-
-	while (true)
-	{
-		clientSocket = accept(listenSocket, (struct sockaddr *)&clientAddr, &addrLen);
-		if (clientSocket == INVALID_SOCKET)
-		{
-			cout << "Error - Accept Failure\n";
-			return;
-		}
-
-		char ID[10];
-		int retval = recv(clientSocket, ID, sizeof(ID), 0);
-		if (retval == SOCKET_ERROR)
-			cout << "Recv Error\n";
-
-		int new_id = atoi(ID);
-
-		if (clients[new_id].connected)
-		{
-			closesocket(clientSocket);
-			continue;
-		}
-		else if (new_id == -1)
-		{
-			closesocket(clientSocket);
-			continue;
-		}
-
-		DB_SQL_GET_POS(new_id);
-
-		clients[new_id].socket = clientSocket;
-		clients[new_id].over.dataBuffer.len = MAX_BUFFER;
-		clients[new_id].over.dataBuffer.buf = clients[clientSocket].over.messageBuffer;
-		clients[new_id].over.act = ACT::RECV;
-		clients[new_id].viewlist.clear();
-		clients[new_id].prev_size = 0;
-		ZeroMemory(&clients[new_id].over.overlapped, sizeof(WSAOVERLAPPED));
-		flags = 0;
-
-		CreateIoCompletionPort(reinterpret_cast<HANDLE>(clientSocket), g_iocp, new_id, 0);
-		clients[new_id].connected = true;
-
-		send_login_ok_packet(new_id);
-		send_put_player_packet(new_id, new_id);
-
-		for (int i = 0; i < MAX_USER; ++i) {
-			if (false == clients[i].connected) continue;
-			if (i == new_id) continue;
-			if (false == is_near_object(i, new_id)) continue;
-			clients[new_id].access_lock.lock();
-			clients[new_id].viewlist.insert(i);
-			clients[new_id].access_lock.unlock();
-			send_put_player_packet(new_id, i);
-		}
-
-		for (int i = 0; i < MAX_USER; ++i) {
-			if (false == clients[i].connected) continue;
-			if (i == new_id) continue;
-			if (false == is_near_object(i, new_id)) continue;
-			clients[i].access_lock.lock();
-			clients[i].viewlist.insert(new_id);
-			clients[i].access_lock.unlock();
-			send_put_player_packet(i, new_id);
-		}
-
-
-		for (int i = 0; i < NUM_NPC; ++i) {
-			int npc_id = i + NPC_ID_START;
-			if (false == clients[npc_id].connected) continue;
-			if (false == is_near_object(npc_id, new_id)) continue;
-			wake_up_npc(npc_id);
-			clients[new_id].access_lock.lock();
-			clients[new_id].viewlist.insert(npc_id);
-			clients[new_id].access_lock.unlock();
-			send_put_player_packet(new_id, npc_id);
-		}
-		do_recv(new_id);
-	}
-
-	// 6-2. 리슨 소켓종료
-	closesocket(listenSocket);
-
-	// Winsock End
-	WSACleanup();
-
-	return;
-}
-
-void timer()
-{
-	while (true) {
-		this_thread::sleep_for(1ms);
-		while (true) {
-			t_lock.lock();
-			if (true == timer_queue.empty()) {
-				t_lock.unlock();  break;
-			}
-			TIMER_EVENT ev = timer_queue.top();
-			if (ev.exec_time <= std::chrono::high_resolution_clock::now()) {
-				timer_queue.pop();
-				t_lock.unlock();
-				OVER_EX *ex_over = new OVER_EX;
-				ex_over->act = MOVE;
-				PostQueuedCompletionStatus(g_iocp, 1, ev.id, &
-					ex_over->overlapped);
-			}
-			else {
-				t_lock.unlock();  break;
-			}
-		}
-	}
-}
-
-void save_pos_db()
-{
-	std::chrono::high_resolution_clock::time_point save_time = std::chrono::high_resolution_clock::now();
-	while (true)
-	{
-		if (save_time + 10s <= std::chrono::high_resolution_clock::now())
-		{
-			for (int i = 0; i < MAX_USER; ++i)
-			{
-				if (clients[i].connected)
-				{
-					DB_SQL_SET_POS(i);
-				}
-			}
-			save_time = std::chrono::high_resolution_clock::now();
-		}
-	}
-}
-
-int main()
-{
-	std::vector <std::thread> worker_threads;
-	wcout.imbue(locale("korean"));
-	initialize();
-	g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
-	for (int i = 0; i < 6; ++i)
-		worker_threads.emplace_back(std::thread{ worker_thread });
-	std::thread accept_thread{ do_accept };
-	std::thread timer_thread{ timer };
-	std::thread save_thread{ save_pos_db };
-
-	accept_thread.join();
-	timer_thread.join();
-	save_thread.join();
-	for (auto &th : worker_threads) th.join();
-	CloseHandle(g_iocp);
-	SQLCancel(hstmt);
-	SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-	SQLDisconnect(hdbc);
-	SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
-	SQLFreeHandle(SQL_HANDLE_ENV, henv);
-}
-
-//wsprintf((LPWSTR)Query, L"UPDATE user_table SET user_posx = %d, user_posy = %d WHERE user_id = %d", clients[id].x, clients[id].y, id);
-//retcode = SQLExecDirect(hstmt, (SQLWCHAR *)Query, SQL_NTS);
-//
-//retcode = SQLBindCol(hstmt, 1, SQL_C_CHAR, UserId, NAME_LEN, &cbUserId);// 스트링이니까 최대길이 name_len
-//retcode = SQLBindCol(hstmt, 2, SQL_C_LONG, &UserX, 100, &cbUserX);// 
-//retcode = SQLBindCol(hstmt, 3, SQL_C_LONG, &UserY, 100, &cbUserY);//인티져니까 sLevel에 &
-//
-//for (int i = 0; ; i++) {
-//	retcode = SQLFetch(hstmt);
-//	if (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO)
-//		wprintf(L"%d: %S %d %d\n", i + 1, UserId, UserX, UserY);// wprintf여서 한글도 제대로 나옴
-//}
