@@ -1,0 +1,18 @@
+﻿  main.cpp
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(247): warning C4244: '인수': 'double'에서 'int'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(312): warning C4996: 'WSASocketA': Use WSASocketW() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings
+  c:\program files (x86)\windows kits\10\include\10.0.17763.0\um\winsock2.h(3416): note: 'WSASocketA' 선언을 참조하십시오.
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(318): warning C4996: 'inet_addr': Use inet_pton() or InetPton() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings
+  c:\program files (x86)\windows kits\10\include\10.0.17763.0\um\winsock2.h(1831): note: 'inet_addr' 선언을 참조하십시오.
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(346): warning C4996: 'WSAAsyncSelect': Use WSAEventSelect() instead or define _WINSOCK_DEPRECATED_NO_WARNINGS to disable deprecated API warnings
+  c:\program files (x86)\windows kits\10\include\10.0.17763.0\um\winsock2.h(2680): note: 'WSAAsyncSelect' 선언을 참조하십시오.
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(552): warning C4101: 'iobyte' :참조되지 않은 지역 변수입니다.
+c:\users\jes\desktop\gameserverprogramming-termproject-master - 복사본 - 복사본\gameserverprogramming-termproject-master\game client\win32project\main.cpp(569): warning C4101: 'iobyte' :참조되지 않은 지역 변수입니다.
+  mdump.cpp
+  win_sock.cpp
+  코드를 생성하고 있습니다.
+  0 of 245 functions ( 0.0%) were compiled, the rest were copied from previous compilation.
+    0 functions were new in current compilation
+    0 functions had inline decision re-evaluated but remain unchanged
+  코드를 생성했습니다.
+  Win32Project.vcxproj -> C:\Users\JES\Desktop\GameServerProgramming-TermProject-master - 복사본 - 복사본\GameServerProgramming-TermProject-master\Game Client\Release\Win32Project.exe
